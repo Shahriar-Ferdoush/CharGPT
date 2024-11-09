@@ -11,6 +11,7 @@ learning_rate = 1e-3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 eval_iters = 200
 n_embed = 32
+head_count = 4
 
 
 # Torch Seed for reproducibility
@@ -102,6 +103,18 @@ class Head(nn.Module):
         return out
 
 
+class MultiHeadAttention(nn.Module):
+    """
+    Multi head self attention block
+    """
+
+    def __init__(self, n_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+
+    def forward(self, x):
+        return torch.cat([head(x) for head in self.heads], dim=-1)
+
 class BigramLanguageModel(nn.Module):
 
     def __init__(self):
@@ -110,7 +123,7 @@ class BigramLanguageModel(nn.Module):
         # Each token directly reads off the logits for the next tokens from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.sa_head = Head(n_embed)
+        self.sa_head = MultiHeadAttention(head_count, n_embed//head_count)    # 4 communivcation channel
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
