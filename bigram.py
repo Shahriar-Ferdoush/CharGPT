@@ -5,11 +5,12 @@ from torch.nn import functional as F
 # Hyperparameters
 batch_size = 32
 block_size = 8
-max_iters = 3000
+max_iters = 5000
 eval_interval = 300
-learning_rate = 1e-2
+learning_rate = 1e-3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 eval_iters = 200
+n_embed = 32
 
 
 # Torch Seed for reproducibility
@@ -55,7 +56,7 @@ def get_batch(split):
 def estimate_loss():
     out = {}
     model.eval()
-    
+
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         for i in range(eval_iters):
@@ -63,29 +64,74 @@ def estimate_loss():
             logits, loss = model(X, Y)
             losses[i] = loss.item()
         out[split] = losses.mean()
-    
+
     model.train()
     return out
 
 
+class Head(nn.Module):
+    """
+    One head self attention block
+    """
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embed, head_size, bias=False)  # (C, H)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+
+        # Compute the key, query and value
+        k = self.key(x)  # (B, T, C) @ (C, H) --> (B, T, H)
+        q = self.query(x)  # (B, T, H)
+
+        # Compute the attention score
+        wei = (
+            q @ k.transpose(-2, -1) * C ** (-0.5)
+        )  # (B, T, H) @ (B, H, T) --> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        wei = F.softmax(wei, dim=-1)  # (B, T, T)
+
+        # Compute the weighted aggregation of the value
+        v = self.value(x)  # (B, T, H)
+        out = wei @ v  # (B, T, T) @ (B, T, H) --> (B, T, H)
+
+        return out
+
+
 class BigramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
 
         # Each token directly reads off the logits for the next tokens from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.sa_head = Head(n_embed)
+        self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
+        B, T = idx.shape
+
         # idx and target are both (B, T) dimentional tensor of integers
-        logits = self.token_embedding_table(idx) # (B, T, C)
+        token_embeddings = self.token_embedding_table(idx)  # (B, T, C)
+        position_embeddings = self.position_embedding_table(
+            torch.arange(T).to(device)
+        )  # (T, C)
+
+        x = token_embeddings + position_embeddings  # (B, T, C)
+        x = self.sa_head(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            target = targets.view(B*T)
+            logits = logits.view(B * T, C)
+            target = targets.view(B * T)
             loss = F.cross_entropy(logits, target)
 
         return logits, loss
@@ -93,21 +139,22 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
+            idx_context = idx[:, -block_size:]  # (B, T)
             # Get the predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_context)
             # Focus on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
+            logits = logits[:, -1, :]  # becomes (B, C)
             # Apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
+            probs = F.softmax(logits, dim=-1)  # (B, C)
             # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             # Append sampled
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        
-        return idx
-    
+            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
 
-model = BigramLanguageModel(vocab_size).to(device)
+        return idx
+
+
+model = BigramLanguageModel()
 m = model.to(device)
 
 # Optimizer
@@ -118,11 +165,13 @@ for iter in range(max_iters):
     # After every eval_interval evaluate the loss on train and val data
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"Iter: {iter}, Train Loss: {losses['train']:0.4f}, Val Loss: {losses['val']:0.4f}")
-    
+        print(
+            f"Iter: {iter}, Train Loss: {losses['train']:0.4f}, Val Loss: {losses['val']:0.4f}"
+        )
+
     # Get a batch of data
     X, Y = get_batch("train")
-    
+
     # Compute the loss
     logits, loss = model(X, Y)
     optimizer.zero_grad(set_to_none=True)
@@ -130,7 +179,6 @@ for iter in range(max_iters):
     optimizer.step()
 
 
-
 # Generate from the model
 context = torch.zeros((1, 1), dtype=torch.long).to(device)
-print(decode(m.generate(context, 400).squeeze().tolist()))
+print(decode(m.generate(context, 200).squeeze().tolist()))
