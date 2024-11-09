@@ -111,9 +111,12 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_heads * head_size, n_embed)
 
     def forward(self, x):
-        return torch.cat([head(x) for head in self.heads], dim=-1)
+        out = torch.cat([head(x) for head in self.heads], dim=-1)  # (B, T, H * n_heads)
+        out = self.proj(out)  # (B, T, C)
+        return out
 
 
 class FeedForward(nn.Module):
@@ -124,8 +127,10 @@ class FeedForward(nn.Module):
     def __init__(self, hidden_size, dropout=0.1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(hidden_size, 4 * hidden_size),
             nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden_size, hidden_size),
         )
 
     def forward(self, x):
@@ -142,11 +147,14 @@ class Block(nn.Module):
         head_size = n_embd // n_heads
         self.sa_head = MultiHeadAttention(n_heads, head_size)
         self.ffwd = FeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
 
     def forward(self, x):
-        x = self.sa_head(x)
-        x = self.ffwd(x)
+        x = x + self.sa_head( self.ln1(x) )
+        x = x + self.ffwd( self.ln2(x) )
         return x
+
 
 class BigramLanguageModel(nn.Module):
 
@@ -156,10 +164,14 @@ class BigramLanguageModel(nn.Module):
         # Each token directly reads off the logits for the next tokens from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.sa_head = MultiHeadAttention(
-            head_count, n_embed // head_count
-        )  # 4 communication channel
-        self.ffwd = FeedForward(n_embed)
+
+        self.blocks = nn.Sequential(
+            Block(n_embed, head_count),
+            Block(n_embed, head_count),
+            Block(n_embed, head_count),
+            nn.LayerNorm(n_embed)
+        )
+
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -172,8 +184,8 @@ class BigramLanguageModel(nn.Module):
         )  # (T, C)
 
         x = token_embeddings + position_embeddings  # (B, T, C)
-        x = self.sa_head(x)
-        x = self.ffwd(x)  # (B, T, C)
+        x = self.blocks(x)
+
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
